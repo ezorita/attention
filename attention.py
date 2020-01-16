@@ -311,19 +311,12 @@ class Albert(nn.Module):
       none = torch.Tensor([]).to(self.device)
 
       
-      try:
-         seg_embeds = [
-            torch.cat(
-               (zero,
-                seqA.repeat((1,la+1,1)),
-                seqB.repeat((1,lb+1,1)),
-                zero.repeat(1,self.L-la-lb-3,1) if self.L-la-lb-3 > 0 else none
-               ), -2) for la, lb in seglens]
-      except:
-         extype, value, tb = sys.exc_info()
-         traceback.print_exc()
-         pdb.post_mortem(tb)
-         
+      seg_embeds = [torch.cat((zero,
+                               seqA.repeat((1,la+1,1)),
+                               seqB.repeat((1,lb+1,1)),
+                               zero.repeat(1,self.L-la-lb-3,1) if self.L-la-lb-3 > 0 else none)
+                              , -2) for la, lb in seglens]
+      
       return torch.stack(seg_embeds)[:,0]
 
    
