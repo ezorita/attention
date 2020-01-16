@@ -3,19 +3,14 @@ import torch.nn as nn
 from torch import LongTensor as lt
 import numpy as np
 
-class ProteinSeq():
-   def __init__(self, fname, test_size=0.2, random_state=None, device=None):
+class Sequence():
+   def __init__(self, vocab, replace_symbols, fname, test_size=0.2, random_state=None, device=None):
 
       self.device = device if device is not None else 'cuda' if torch.cuda.is_available() else 'cpu'
-      
-      # Vocabulary
-      self.vocab = {'PAD': 0, 'A': 1, 'C': 2, 'D': 3, 'E': 4, 'F': 5, 'G': 6,
-                    'H': 7, 'I': 8, 'K': 9, 'L': 10,'M': 11,'N': 12,'P': 13,
-                    'Q': 14,'R': 15,'S': 16,'T': 17,'V': 18,'W': 19,'Y': 20,
-                    'CLS': 21, 'SEP': 22, 'MASK': 23
-      }
+
+      self.vocab = vocab
+      self.replace_symbols = replace_symbols
       self.vocab_lut = list(self.vocab.keys())
-      self.replace_symbols = torch.arange(1,21) # Vocabulary indices that represent aminoacids (for random replacement)
       
       # Number of symbols
       self.n_symbols = len(self.vocab)
@@ -145,6 +140,36 @@ class ProteinSeq():
       seglens = [seg_lens[i] for i in np.array_split(idx, sop_batch.shape[0]//batch_size)]
       
       return batches, seglens, targets
+   
+
+
+class ProteinSeq(Sequence):
+   def __init__(self, fname, test_size=0.2, random_state=None, device=None):
+      # Vocabulary
+      vocab = {'PAD': 0, 'A': 1, 'C': 2, 'D': 3, 'E': 4, 'F': 5, 'G': 6,
+               'H': 7, 'I': 8, 'K': 9, 'L': 10,'M': 11,'N': 12,'P': 13,
+               'Q': 14,'R': 15,'S': 16,'T': 17,'V': 18,'W': 19,'Y': 20,
+               'CLS': 21, 'SEP': 22, 'MASK': 23
+      }
+      
+      # Vocabulary indices that represent aminoacids (for random replacement)
+      replace_symbols = torch.arange(1,21)
+
+      super().__init__(vocab, replace_symbols, fname, test_size, random_state, device)
+
+class DNASeq(Sequence):
+   def __init__(self, fname, test_size=0.2, random_state=None, device=None):
+      # Vocabulary
+      vocab = {'PAD': 0, 'A': 1, 'C': 2, 'G': 3, 'T': 4,
+               'CLS': 5, 'SEP': 6, 'MASK': 7
+      }
+      
+      # Vocabulary indices that represent aminoacids (for random replacement)
+      replace_symbols = torch.arange(1,5)
+
+      super().__init__(vocab, replace_symbols, fname, test_size, random_state, device)
+
+
 
 
 # Applies random deletions, returns new sequence and attention mask
