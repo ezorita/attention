@@ -16,13 +16,13 @@ if __name__ == "__main__":
       seqs = sequence.ProteinSeq(sys.argv[2], test_size=0.2, device='cuda')
 
       albert = attention.Albert(
-         N = 6,
-         E = 64,
-         H = 256,
-         h = 8,
-         d_ffn = 1024,
-         L = seqs.seqlen + 3,
-         n_word = seqs.n_symbols
+         N = 6, # number of layers (self-attention blocks)
+         E = 64, # Embedding dimension
+         H = 256, # Hidden dimension
+         h = 8, # Number of self-attention heads
+         d_ffn = 1024, # Boom dimension
+         L = seqs.seqlen + 3, # Sequence length
+         n_word = seqs.n_symbols # Vocabulary size
       )
 
       epochs = 300
