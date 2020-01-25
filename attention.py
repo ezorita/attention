@@ -23,21 +23,12 @@ class GELU(nn.Module):
 Embeddings
 '''
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model):
-        super(PositionalEncoding, self).__init__()
+def matrixR(L, d_model):
+   inv_freq = 1 / (10000 ** (torch.arange(0.0, d_model, 2.0) / d_model))
+   sinusoid_inp = torch.ger(torch.arange(L-1,dtype=torch.float32), inv_freq)
+   return torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1).transpose(-2,-1)
 
-        self.d_model = d_model
 
-        inv_freq = 1 / (10000 ** (torch.arange(0.0, d_model, 2.0) / d_model))
-        self.register_buffer('inv_freq', inv_freq)
-
-    def forward(self, pos_seq):
-        sinusoid_inp = torch.ger(pos_seq, self.inv_freq)
-        pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
-
-        return pos_emb[None,:,:]
-         
 ''' 
 Attention building blocks
 '''
@@ -106,32 +97,30 @@ class RelativeMultiHeadedAttention(nn.Module):
       self.h = h
       self.d_model = d_model
       self.mask = mask
-      R = PositionalEncoding(d_model)(torch.arange(L-1,-L,-1,dtype=torch.float32)) # Relative positional encodings
-      R = R.transpose(-2,-1).contiguous()
-      self.register_buffer('R', R)
+      self.R = nn.Parameter(matrixR(L+1, d_model))
 
       # Linear transformations of embeddings
-      self.Wq = nn.Parameter(_init_matrix(h, d_model, d_model//h))
-      self.Wv = nn.Parameter(_init_matrix(h, d_model//h, d_model))
-      self.Wke = nn.Parameter(_init_matrix(h, d_model//h, d_model))
-      self.Wkr = nn.Parameter(_init_matrix(h, d_model//h, d_model))
+      self.Wq = nn.Parameter(_init_matrix(d_model, d_model))
+      self.Wv = nn.Parameter(_init_matrix(d_model, d_model))
+      self.Wke = nn.Parameter(_init_matrix(d_model, d_model))
+      self.Wkr = nn.Parameter(_init_matrix(d_model, d_model))
 
       # Position and content biases
-      self.cb = nn.Parameter(_init_matrix(1,h,1,d_model//h)) # Content bias
-      self.pb = nn.Parameter(_init_matrix(1,h,1,d_model//h)) # Position bias
+      self.cb = nn.Parameter(torch.zeros(d_model)) # Content bias
+      self.pb = nn.Parameter(torch.zeros(d_model)) # Position bias
 
       # Output layers
-      self.do = nn.Dropout(p = dropout) if dropout > 0 else None      
+      self.do = nn.Dropout(p = dropout) if dropout > 0 else None
       self.Wo = nn.Linear(d_model, d_model)
       self.ln = nn.LayerNorm(d_model)
-      
+
    def _shift_b(self, b):
       # Inspired by https://github.com/kimiyoung/transformer-xl/blob/44781ed21dbaec88b280f74d9ae2877f52b492a5/pytorch/mem_transformer.py#L194
       z = torch.zeros(b.shape[0], b.shape[1], b.shape[2], 1, device=b.device)
       b_pad = torch.cat((z,b), 3).view(b.shape[0], b.shape[1], b.shape[3]+1, b.shape[2])
       return b_pad[:,:,1:].view_as(b)[:,:,:,:b.shape[2]]
 
-   
+
    def forward(self, E, Ev, mask=None):
       '''
          Ev, E  ~  (Batch, L, d_model)
@@ -147,20 +136,21 @@ class RelativeMultiHeadedAttention(nn.Module):
             Oh  ~  (Batch, h, d_model/h, L)
              O  ~  (Batch, L, d_model)
       '''
-      q = torch.einsum('iykl,xjlm->ijkm', (E[:,None,:,:], self.Wq[None,:,:,:]))
-      k = torch.einsum('xjkl,iyml->ijkm', (self.Wke[None,:,:,:], E[:,None,:,:]))
-      v = torch.einsum('xjkl,iyml->ijkm', (self.Wv[None,:,:,:], Ev[:,None,:,:]))
-      Q = torch.einsum('ijk,xkl->ijl', (self.Wkr, self.R))[None,:,:,:]
-      b = torch.einsum('ijkl,xjlm->ijkm', (q, Q))
-      d = torch.einsum('ijkl,ijlm->ijkm', (self.pb, Q))
-      
+      q = torch.matmul(E, self.Wq).view(E.shape[0], E.shape[1], self.h, -1).transpose(1,2)
+      k = torch.matmul(E, self.Wke).view(E.shape[0], E.shape[1], self.h, -1).transpose(1,2)
+      v = torch.matmul(Ev, self.Wv).view(E.shape[0], E.shape[1], self.h, -1).transpose(1,2)
+      # Not the query, the matrix Q page 12 of Transformer-XL.
+      Q = torch.matmul(self.Wkr, self.R).view((1,self.h,-1,E.shape[1])).repeat(E.shape[0],1,1,1)
+      B = torch.matmul(q,Q)
+      D = torch.matmul(self.pb.view(1,self.h,1,-1).repeat(E.shape[0],1,E.shape[1],1),Q)
+
       # Attention matrix
-      A_a = torch.einsum('ijkl,ijlm->ijkm',(q,k))
-      A_b = self._shift_b(b)
-      
+      A_a = torch.matmul(q,k.transpose(-2,-1))
+      A_b = self._shift_b(B)
+
       # Compute bias vector and replicate to row dimension L
-      A_c = torch.einsum('xjkl,ijlm->ijkm',(self.cb,k)).repeat(1,1,k.shape[-1],1)
-      A_d = self._shift_b(d.repeat(1,1,E.shape[-2],1))
+      A_c = torch.matmul(self.cb.view(1,self.h,1,-1).repeat(E.shape[0],1,E.shape[1],1),k.transpose(-2,-1))
+      A_d = self._shift_b(D)
 
       # Attention matrix
       A = A_a + A_b + A_c + A_d
@@ -178,13 +168,14 @@ class RelativeMultiHeadedAttention(nn.Module):
          p_attn = self.do(p_attn)
 
       # Apply attention to v
-      Oh = torch.einsum('ijkl,ijml->ijkm',(v,A))
+      Oh = torch.einsum('ijkl,ijlm->ijkm', (p_attn, v))
 
       # Concatenate attention output
-      O = Oh.view(Oh.shape[0], -1, Oh.shape[-1]).transpose(-2,-1)
+      O = Oh.contiguous().view(E.shape)
 
       # Layer norm and residual connection
       return self.ln(Ev + self.Wo(O))
+
 
    
 class FeedForwardNet(nn.Module):
