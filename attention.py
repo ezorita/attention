@@ -67,19 +67,19 @@ class MultiHeadedAttention(nn.Module):
               Oh ~ (Batch, h, d_model/h, L)
                O ~ (Batch, L, d_model)
       '''
-      Qh = self.Wq(q).transpose(-2,-1).contiguous().view(q.shape[0], self.h, -1, q.shape[-2])
-      Kh = self.Wk(q).transpose(-2,-1).contiguous().view(q.shape[0], self.h, -1, q.shape[-2])
-      Vh = self.Wv(v).transpose(-2,-1).contiguous().view(q.shape[0], self.h, -1, q.shape[-2])
+      Qh = self.Wq(q).view(q.shape[0], q.shape[1], self.h, -1).transpose(1,2)
+      Kh = self.Wk(q).view(q.shape[0], q.shape[1], self.h, -1).transpose(1,2)
+      Vh = self.Wk(v).view(q.shape[0], q.shape[1], self.h, -1).transpose(1,2)
 
       # Scaled Dot Product Attention in h blocks QKh_b = dot(Qh_b^T, Kh_b) for all h (head) and b (batch)
-      qk = torch.einsum('ijkl,ijkn->ijln', (Qh, Kh))/np.sqrt(self.d_model)
+      qk = torch.einsum('ijlk,ijmk->ijlm', (Qh, Kh)) / np.sqrt(self.d_model)
 
       # Reset mask values to -Inf (softmax prob ~ 0)
       if mask is not None:
          qk = qk.masked_fill(mask == 0, float('-inf'))
       elif self.mask is not None:
-            qk = qk.masked_fill(self.mask == 0, float('-inf'))
-         
+         qk = qk.masked_fill(self.mask == 0, float('-inf'))
+             
       # Softmax on sample dimension (not d_model)
       p_attn = F.softmax(qk, dim=-1)
 
@@ -88,13 +88,14 @@ class MultiHeadedAttention(nn.Module):
          p_attn = self.do(p_attn)
 
       # Apply attention to Vh -> Oh = dot(p_attn, Vh^T)
-      Oh = torch.einsum('ijkl,ijml->ijkm', (Vh, p_attn))
+      Oh = torch.einsum('ijkl,ijlm->ijkm', (p_attn, Vh))
 
       # Concatenate attention output
-      O = Oh.view(Oh.shape[0], -1, Oh.shape[-1]).transpose(-2,-1)
+      O = Oh.contiguous().view(q.shape)
 
       # Layer norm and residual connection
       return self.ln(q + self.Wo(O))
+
 
 class RelativeMultiHeadedAttention(nn.Module):
 
