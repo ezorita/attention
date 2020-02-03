@@ -5,6 +5,10 @@ import torch.nn.functional as F
 from torch.nn import init
 import pdb, traceback, sys
 
+from torch import LongTensor as lt
+from lamb import Lamb
+
+
 '''
 Aux functions
 '''
@@ -23,24 +27,21 @@ class GELU(nn.Module):
 Embeddings
 '''
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model):
-        super(PositionalEncoding, self).__init__()
+def matrixR(L, d_model, reverse=False):
+   inv_freq = 1 / (10000 ** (torch.arange(0.0, d_model, 2.0) / d_model))
+   sinusoid_inp = torch.ger(torch.arange(L,dtype=torch.float32), inv_freq)
+   mat = torch.zeros(L, d_model)
+   mat[:,torch.arange(0,d_model,2)] = sinusoid_inp.sin()
+   mat[:,torch.arange(1,d_model,2)] = sinusoid_inp.cos()
+   if reverse:
+      mat = mat[torch.arange(L-1,-1,-1),:]
+   return mat
 
-        self.d_model = d_model
 
-        inv_freq = 1 / (10000 ** (torch.arange(0.0, d_model, 2.0) / d_model))
-        self.register_buffer('inv_freq', inv_freq)
-
-    def forward(self, pos_seq):
-        sinusoid_inp = torch.ger(pos_seq, self.inv_freq)
-        pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
-
-        return pos_emb[None,:,:]
-         
 ''' 
 Attention building blocks
 '''
+
 
 class MultiHeadedAttention(nn.Module):
    
@@ -67,34 +68,32 @@ class MultiHeadedAttention(nn.Module):
               Oh ~ (Batch, h, d_model/h, L)
                O ~ (Batch, L, d_model)
       '''
-      Qh = self.Wq(q).transpose(-2,-1).contiguous().view(q.shape[0], self.h, -1, q.shape[-2])
-      Kh = self.Wk(q).transpose(-2,-1).contiguous().view(q.shape[0], self.h, -1, q.shape[-2])
-      Vh = self.Wv(v).transpose(-2,-1).contiguous().view(q.shape[0], self.h, -1, q.shape[-2])
+      Qh = self.Wq(q).view(q.shape[0], q.shape[1], self.h, -1).transpose(1,2)
+      Kh = self.Wk(v).view(q.shape[0], v.shape[1], self.h, -1).transpose(1,2)
+      Vh = self.Wv(v).view(q.shape[0], v.shape[1], self.h, -1).transpose(1,2)
 
       # Scaled Dot Product Attention in h blocks QKh_b = dot(Qh_b^T, Kh_b) for all h (head) and b (batch)
-      qk = torch.einsum('ijkl,ijkn->ijln', (Qh, Kh))/np.sqrt(self.d_model)
+      qk = torch.einsum('ijlk,ijmk->ijlm', (Qh, Kh)) / np.sqrt(self.d_model)
 
       # Reset mask values to -Inf (softmax prob ~ 0)
       if mask is not None:
          qk = qk.masked_fill(mask == 0, float('-inf'))
       elif self.mask is not None:
-            qk = qk.masked_fill(self.mask == 0, float('-inf'))
-         
+         qk = qk.masked_fill(self.mask == 0, float('-inf'))
+             
       # Softmax on sample dimension (not d_model)
       p_attn = F.softmax(qk, dim=-1)
 
-      # Dropout to attention probabilities
-      if self.do is not None:
-         p_attn = self.do(p_attn)
-
       # Apply attention to Vh -> Oh = dot(p_attn, Vh^T)
-      Oh = torch.einsum('ijkl,ijml->ijkm', (Vh, p_attn))
+      Oh = torch.einsum('ijkl,ijlm->ijkm', (p_attn, Vh))
 
       # Concatenate attention output
-      O = Oh.view(Oh.shape[0], -1, Oh.shape[-1]).transpose(-2,-1)
+      O = Oh.transpose(1,2).contiguous().view(q.shape)
 
       # Layer norm and residual connection
-      return self.ln(q + self.Wo(O))
+      return self.ln(q + self.do(self.Wo(O)))
+
+
 
 class RelativeMultiHeadedAttention(nn.Module):
 
@@ -105,32 +104,31 @@ class RelativeMultiHeadedAttention(nn.Module):
       self.h = h
       self.d_model = d_model
       self.mask = mask
-      R = PositionalEncoding(d_model)(torch.arange(L-1,-L,-1,dtype=torch.float32)) # Relative positional encodings
-      R = R.transpose(-2,-1).contiguous()
-      self.register_buffer('R', R)
+      self.R = nn.Parameter(matrixR(L, d_model, reverse=True))
 
       # Linear transformations of embeddings
-      self.Wq = nn.Parameter(_init_matrix(h, d_model, d_model//h))
-      self.Wv = nn.Parameter(_init_matrix(h, d_model//h, d_model))
-      self.Wke = nn.Parameter(_init_matrix(h, d_model//h, d_model))
-      self.Wkr = nn.Parameter(_init_matrix(h, d_model//h, d_model))
+      self.Wq = nn.Parameter(_init_matrix(d_model, d_model))
+      self.Wv = nn.Parameter(_init_matrix(d_model, d_model))
+      self.Wke = nn.Parameter(_init_matrix(d_model, d_model))
+      self.Wkr = nn.Parameter(_init_matrix(d_model, d_model))
 
       # Position and content biases
-      self.cb = nn.Parameter(_init_matrix(1,h,1,d_model//h)) # Content bias
-      self.pb = nn.Parameter(_init_matrix(1,h,1,d_model//h)) # Position bias
+      self.cb = nn.Parameter(torch.ones(d_model)) # Content bias
+      self.pb = nn.Parameter(torch.ones(d_model)) # Position bias
 
       # Output layers
-      self.do = nn.Dropout(p = dropout) if dropout > 0 else None      
+      self.do = nn.Dropout(p = dropout) if dropout > 0 else None
       self.Wo = nn.Linear(d_model, d_model)
       self.ln = nn.LayerNorm(d_model)
-      
-   def _shift_b(self, b):
-      # Inspired by https://github.com/kimiyoung/transformer-xl/blob/44781ed21dbaec88b280f74d9ae2877f52b492a5/pytorch/mem_transformer.py#L194
-      z = torch.zeros(b.shape[0], b.shape[1], b.shape[2], 1, device=b.device)
-      b_pad = torch.cat((z,b), 3).view(b.shape[0], b.shape[1], b.shape[3]+1, b.shape[2])
-      return b_pad[:,:,1:].view_as(b)[:,:,:,:b.shape[2]]
 
-   
+   def _shift_b(self, B):
+      b = B.shape[0]
+      h = B.shape[1]
+      L = B.shape[2]
+      # Inspired by https://github.com/kimiyoung/transformer-xl/blob/44781ed21dbaec88b280f74d9ae2877f52b492a5/pytorch/mem_transformer.py#L194
+      return torch.cat([torch.zeros(b,h,L,1, device=B.device), B], -1).view(b,h,-1,L)[:,:,1:,:].tril()
+
+
    def forward(self, E, Ev, mask=None):
       '''
          Ev, E  ~  (Batch, L, d_model)
@@ -146,20 +144,22 @@ class RelativeMultiHeadedAttention(nn.Module):
             Oh  ~  (Batch, h, d_model/h, L)
              O  ~  (Batch, L, d_model)
       '''
-      q = torch.einsum('iykl,xjlm->ijkm', (E[:,None,:,:], self.Wq[None,:,:,:]))
-      k = torch.einsum('xjkl,iyml->ijkm', (self.Wke[None,:,:,:], E[:,None,:,:]))
-      v = torch.einsum('xjkl,iyml->ijkm', (self.Wv[None,:,:,:], Ev[:,None,:,:]))
-      Q = torch.einsum('ijk,xkl->ijl', (self.Wkr, self.R))[None,:,:,:]
-      b = torch.einsum('ijkl,xjlm->ijkm', (q, Q))
-      d = torch.einsum('ijkl,ijlm->ijkm', (self.pb, Q))
-      
+      q = torch.matmul(E,  self.Wq ).view(E.shape[0],  E.shape[1],  self.h, -1).transpose(1,2)
+      k = torch.matmul(Ev, self.Wke).view(Ev.shape[0], Ev.shape[1], self.h, -1).transpose(1,2)
+      v = torch.matmul(Ev, self.Wv ).view(Ev.shape[0], Ev.shape[1], self.h, -1).transpose(1,2)
+      # Not the query, the matrix Q page 12 of Transformer-XL.
+      #Q = torch.matmul(self.Wkr, self.R).view((1,self.h,-1,E.shape[1])).repeat(E.shape[0],1,1,1)
+      Q = torch.matmul(self.R, self.Wkr).view(1,E.shape[1], self.h, -1).transpose(1,2).repeat(E.shape[0],1,1,1)
+      B = torch.matmul(q,Q.transpose(-2,-1))
+      D = torch.matmul(self.pb.view(1,self.h,1,-1).repeat(E.shape[0],1,E.shape[1],1),Q.transpose(-2,-1))
+
       # Attention matrix
-      A_a = torch.einsum('ijkl,ijlm->ijkm',(q,k))
-      A_b = self._shift_b(b)
-      
+      A_a = torch.matmul(q,k.transpose(-2,-1))
+      A_b = self._shift_b(B)
+
       # Compute bias vector and replicate to row dimension L
-      A_c = torch.einsum('xjkl,ijlm->ijkm',(self.cb,k)).repeat(1,1,k.shape[-1],1)
-      A_d = self._shift_b(d.repeat(1,1,E.shape[-2],1))
+      A_c = torch.matmul(self.cb.view(1,self.h,1,-1).repeat(E.shape[0],1,E.shape[1],1),k.transpose(-2,-1))
+      A_d = self._shift_b(D)
 
       # Attention matrix
       A = A_a + A_b + A_c + A_d
@@ -173,30 +173,31 @@ class RelativeMultiHeadedAttention(nn.Module):
       p_attn = F.softmax(A, dim=-1)
 
       # Dropout to attention probabilities
-      if self.do is not None:
-         p_attn = self.do(p_attn)
+#      if self.do is not None:
+#         p_attn = self.do(p_attn)
 
       # Apply attention to v
-      Oh = torch.einsum('ijkl,ijml->ijkm',(v,A))
+      Oh = torch.einsum('ijkl,ijlm->ijkm', (p_attn, v))
 
       # Concatenate attention output
-      O = Oh.view(Oh.shape[0], -1, Oh.shape[-1]).transpose(-2,-1)
+      O = Oh.transpose(1,2).contiguous().view_as(Ev)
 
       # Layer norm and residual connection
-      return self.ln(Ev + self.Wo(O))
+      return self.ln(Ev + self.do(self.Wo(O)))
 
-   
+
 class FeedForwardNet(nn.Module):
-   def __init__(self, d_model, d_ffn):
+   def __init__(self, d_model, d_ffn, dropout):
       super(FeedForwardNet, self).__init__()
       
       self.ff = nn.Sequential(nn.Linear(d_model, d_ffn),
                               GELU(),#nn.ReLU(),
                               nn.Linear(d_ffn, d_model))
+      self.do = nn.Dropout(p = dropout)
       self.ln = nn.LayerNorm(d_model)
 
    def forward(self, x):
-      return self.ln(x + self.ff(x))
+      return self.ln(x + self.do(self.ff(x)))
 
    
 ''' 
@@ -207,8 +208,8 @@ class EncoderBlock(nn.Module):
    def __init__(self, d_model, d_ffn, h, dropout=0.1):
       super(EncoderBlock, self).__init__()
       
-      self.attn      = MultiHeadedAttention(d_model, h, dropout=dropout)
-      self.ffn       = FeedForwardNet(d_model, d_ffn)
+      self.attn = MultiHeadedAttention(d_model, h, dropout=dropout)
+      self.ffn  = FeedForwardNet(d_model, d_ffn, dropout=dropout)
       
    def forward(self, x, mask):
       return self.ffn(self.attn(x,x,mask))
@@ -219,7 +220,7 @@ class RelativeEncoderBlock(nn.Module):
       super(RelativeEncoderBlock, self).__init__()
       
       self.attn      = RelativeMultiHeadedAttention(L, d_model, h, dropout=dropout)
-      self.ffn       = FeedForwardNet(d_model, d_ffn)
+      self.ffn       = FeedForwardNet(d_model, d_ffn, dropout=dropout)
       
    def forward(self, x, mask):
       return self.ffn(self.attn(x,x,mask))
@@ -275,8 +276,9 @@ class Albert(nn.Module):
       # Text Embedding Transformations
       self.tok_emb = nn.Embedding(n_word, E).to(self.device)
       self.out_b   = nn.Parameter(torch.zeros(n_word).to(self.device))
-      self.to_hid = nn.Linear(E,H).to(self.device)
-      self.to_emb = nn.Linear(H,E).to(self.device)
+      self.to_hid  = nn.Linear(E,H).to(self.device)
+      self.to_emb  = nn.Linear(H,E).to(self.device)
+      self.do      = nn.Dropout(0.1)
 
       # Sequence Embeddings
       self.seq_emb = nn.Embedding(2, E).to(self.device)
@@ -294,6 +296,16 @@ class Albert(nn.Module):
       self.mlm_head = nn.Sequential(
          nn.Linear(H,H),
          GELU(),#nn.ReLU(),
+         nn.LayerNorm(H)
+      ).to(self.device)
+
+      # NextSequencePrediction head
+      self.callhead = nn.Linear(L*H, 2).to(self.device) # No activation, use with nn.CrossEntropyLoss() in optimization
+
+      # MaskedLanguageModel head
+      self.tokenhead = nn.Sequential(
+         nn.Linear(H,H),
+         GELU(), #nn.ReLU(),
          nn.LayerNorm(H)
       ).to(self.device)
       
@@ -323,8 +335,10 @@ class Albert(nn.Module):
    def forward(self, batch, seglens, mode='pretrain', mask=None):
       # Apply word and sequence embeddings
       token_embeddings = self.tok_emb(batch)
-      segmt_embeddings = self.get_seg_embeds(seglens)
-      x = self.to_hid(token_embeddings + segmt_embeddings)
+      #x = self.to_hid(token_embeddings)
+      pe = matrixR(self.L,self.H).to(self.device).repeat(batch.shape[0],1,1)
+      x = self.do(self.to_hid(token_embeddings) + pe)
+      #x = self.do(self.to_hid(token_embeddings))
 
       # Attention layers
       for att in self.attn:
