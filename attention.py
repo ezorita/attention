@@ -27,15 +27,20 @@ class GELU(nn.Module):
 Embeddings
 '''
 
-def matrixR(L, d_model, reverse=False):
+def matrixR(L, d_model, extended=False):
    inv_freq = 1 / (10000 ** (torch.arange(0.0, d_model, 2.0) / d_model))
-   sinusoid_inp = torch.ger(torch.arange(L,dtype=torch.float32), inv_freq)
-   mat = torch.zeros(L, d_model)
-   mat[:,torch.arange(0,d_model,2)] = sinusoid_inp.sin()
-   mat[:,torch.arange(1,d_model,2)] = sinusoid_inp.cos()
-   if reverse:
-      mat = mat[torch.arange(L-1,-1,-1),:]
-   return mat
+   if extended:
+      sinusoid_inp = torch.ger(torch.arange(-L+1., L+0.), inv_freq)
+      mat = torch.zeros(2*L-1, d_model)
+      mat[:,torch.arange(0,d_model,2)] = sinusoid_inp.sin()
+      mat[:,torch.arange(1,d_model,2)] = sinusoid_inp.cos()
+   else:
+      sinusoid_inp = torch.ger(torch.arange(L+0.), inv_freq)
+      mat = torch.zeros(L, d_model)
+      mat[:,torch.arange(0,d_model,2)] = sinusoid_inp.sin()
+      mat[:,torch.arange(1,d_model,2)] = sinusoid_inp.cos()
+   return mat 
+
 
 
 ''' 
@@ -122,17 +127,25 @@ class RelativeMultiHeadedAttention(nn.Module):
       self.ln = nn.LayerNorm(d_model)
 
    def _shift_b(self, B):
+      # See line 194 of the following link (but we are doing something different).
+      # https://github.com/kimiyoung/transformer-xl/blob/44781ed21dbaec88b280f74d9ae2877f52b492a5/pytorch/mem_transformer.py
       b = B.shape[0]
       h = B.shape[1]
       L = B.shape[2]
-      # Inspired by https://github.com/kimiyoung/transformer-xl/blob/44781ed21dbaec88b280f74d9ae2877f52b492a5/pytorch/mem_transformer.py#L194
-      return torch.cat([torch.zeros(b,h,L,1, device=B.device), B], -1).view(b,h,-1,L)[:,:,1:,:].tril()
+      # Split matrix B (2L-1 x L) in two blocks (the middle column is present in both).
+      B1 = B[:,:,:,:L]
+      B2 = B[:,:,:,L-1:]
+      # Then use cat-zero-view-as-transposed-and-remove-row trick to shift.
+      SB1 = torch.cat([torch.zeros(b,h,L,1, device=B.device), B1], -1).view(b,h,-1,L)[:,:,1:,:].tril(1)
+      SB2 = torch.cat([B2, torch.zeros(b,h,L,1, device=B.device)], -1).view(b,h,-1,L)[:,:,:-1,:].triu(0)
+      # Then reassemble triangular matrices.
+      return SB1 + SB2
 
 
    def forward(self, E, Ev, mask=None):
       '''
          Ev, E  ~  (Batch, L, d_model)
-             R  ~  (1, d_model, 2L-1)
+             R  ~  (2L-1, d_model)
             Wq  ~  (h, d_model, d_model/h)
     Wv,Wke,Wkr  ~  (h, d_model/h, d_model)
         cb, pb  ~  (1, h, 1, d_model/h)
@@ -147,11 +160,11 @@ class RelativeMultiHeadedAttention(nn.Module):
       q = torch.matmul(E,  self.Wq ).view(E.shape[0],  E.shape[1],  self.h, -1).transpose(1,2)
       k = torch.matmul(Ev, self.Wke).view(Ev.shape[0], Ev.shape[1], self.h, -1).transpose(1,2)
       v = torch.matmul(Ev, self.Wv ).view(Ev.shape[0], Ev.shape[1], self.h, -1).transpose(1,2)
-      # Not the query, the matrix Q page 12 of Transformer-XL.
-      #Q = torch.matmul(self.Wkr, self.R).view((1,self.h,-1,E.shape[1])).repeat(E.shape[0],1,1,1)
-      Q = torch.matmul(self.R, self.Wkr).view(1,E.shape[1], self.h, -1).transpose(1,2).repeat(E.shape[0],1,1,1)
+      # Not the query, the matrix Q page 12 of Transformer-XL (or something like that).
+      Q = torch.matmul(self.R, self.Wkr).view(1,-1, self.h, E.shape[-1] // self.h).transpose(1,2).repeat(E.shape[0],1,1,1)
       B = torch.matmul(q,Q.transpose(-2,-1))
       D = torch.matmul(self.pb.view(1,self.h,1,-1).repeat(E.shape[0],1,E.shape[1],1),Q.transpose(-2,-1))
+
 
       # Attention matrix
       A_a = torch.matmul(q,k.transpose(-2,-1))
