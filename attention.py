@@ -284,7 +284,7 @@ class Albert(nn.Module):
       self.seq_emb = nn.Embedding(2, E).to(self.device)
 
       # Self-attention layers
-      self.attn    = [RelativeEncoderBlock(L, H, d_ffn, h, dropout=dropout).to(self.device) for _ in range(N)]
+      self.attn = nn.ModuleList([RelativeEncoderBlock(L, H, d_ffn, h, dropout=dropout).to(self.device) for _ in range(N)])
 
       # CLS Pooling
       self.pooler = nn.Sequential(nn.Linear(H, H), nn.Tanh()).to(self.device)
